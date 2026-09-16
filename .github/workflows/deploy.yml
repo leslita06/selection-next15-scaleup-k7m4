@@ -1,0 +1,68 @@
+name: Déploiement admin.ivoire.tech
+
+# Le tableau de bord est un fichier statique : toute poussée sur main le met
+# en ligne. Le déclenchement manuel reste possible depuis l'onglet Actions.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Deux déploiements ne doivent jamais écrire en même temps dans le même
+# dossier : les exécutions s'enchaînent au lieu de se chevaucher.
+concurrency:
+  group: mise-en-ligne-tableau-de-bord
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Mise en ligne
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Récupère le dépôt
+        uses: actions/checkout@v4
+
+      - name: Vérifie que la page est complète
+        run: |
+          taille=$(wc -c < index.html)
+          echo "index.html : $taille octets"
+          # Une page tronquée mettrait un tableau de bord vide en ligne.
+          [ "$taille" -gt 100000 ] || { echo "::error::index.html anormalement petit"; exit 1; }
+          grep -q '</html>' index.html || { echo "::error::index.html tronqué"; exit 1; }
+          grep -q 'AES-GCM' index.html || { echo "::error::charge chiffrée absente"; exit 1; }
+
+      - name: Prépare la clé SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.VPS_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Envoie la page
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'README.md' \
+            --exclude '.well-known' \
+            -e "ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes" \
+            ./ \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH }}"
+
+      # .well-known est exclu du --delete : certbot y dépose les fichiers de
+      # validation lors du renouvellement du certificat, qu'un déploiement
+      # concurrent supprimerait.
+
+      - name: Vérifie l'empreinte du fichier déposé
+        run: |
+          local_sum=$(sha256sum index.html | cut -d' ' -f1)
+          distant=$(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "sha256sum ${{ secrets.VPS_PATH }}index.html" | cut -d' ' -f1)
+          if [ "$local_sum" != "$distant" ]; then
+            echo "::error::La page déposée diffère de celle du dépôt."
+            exit 1
+          fi
+          echo "Empreinte identique : la page en ligne est bien celle du dépôt."
